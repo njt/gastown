@@ -433,3 +433,154 @@ func saveRigsConfig(path string, cfg *rigsConfigFile) error {
 
 	return os.WriteFile(path, data, 0644)
 }
+
+// DatabasePrefixCheck verifies that each rig's beads database has issue_prefix configured.
+// This is required for bd create to work. Without it, agent bead creation fails with:
+// "database not initialized: issue_prefix config is missing"
+//
+// This can happen when:
+// - The rig was added with a source repo where detectBeadsPrefixFromConfig() failed
+// - The beads.db was regenerated but prefix wasn't carried over
+// - Manual database manipulation
+type DatabasePrefixCheck struct {
+	FixableCheck
+}
+
+// NewDatabasePrefixCheck creates a new database prefix check.
+func NewDatabasePrefixCheck() *DatabasePrefixCheck {
+	return &DatabasePrefixCheck{
+		FixableCheck: FixableCheck{
+			BaseCheck: BaseCheck{
+				CheckName:        "database-prefix",
+				CheckDescription: "Verify beads databases have issue_prefix configured",
+			},
+		},
+	}
+}
+
+// Run checks if each rig's beads database has issue_prefix configured.
+func (c *DatabasePrefixCheck) Run(ctx *CheckContext) *CheckResult {
+	beadsDir := filepath.Join(ctx.TownRoot, ".beads")
+
+	// Load routes.jsonl to get rig paths and expected prefixes
+	routes, err := beads.LoadRoutes(beadsDir)
+	if err != nil {
+		return &CheckResult{
+			Name:    c.Name(),
+			Status:  StatusWarning,
+			Message: fmt.Sprintf("Could not load routes.jsonl: %v", err),
+		}
+	}
+	if len(routes) == 0 {
+		return &CheckResult{
+			Name:    c.Name(),
+			Status:  StatusOK,
+			Message: "No routes configured (nothing to check)",
+		}
+	}
+
+	var missing []string
+	var checked int
+
+	for _, r := range routes {
+		rigBeadsPath := filepath.Join(ctx.TownRoot, r.Path, ".beads")
+		rigDB := filepath.Join(rigBeadsPath, "beads.db")
+
+		// Skip if database doesn't exist (will be created on first use)
+		if _, err := os.Stat(rigDB); os.IsNotExist(err) {
+			continue
+		}
+
+		checked++
+
+		// Check if database has issue_prefix configured
+		// Run: bd --no-daemon config get issue_prefix
+		cmd := exec.Command("bd", "--no-daemon", "config", "get", "issue_prefix")
+		cmd.Dir = filepath.Join(ctx.TownRoot, r.Path)
+
+		output, err := cmd.CombinedOutput()
+		if err != nil {
+			// Command failed - database might be corrupted
+			missing = append(missing, fmt.Sprintf("%s (error: %v)", r.Path, err))
+			continue
+		}
+
+		// Check if prefix is set (output like "gt" or "issue_prefix (not set)")
+		outputStr := strings.TrimSpace(string(output))
+		if strings.Contains(outputStr, "(not set)") || outputStr == "" {
+			expectedPrefix := strings.TrimSuffix(r.Prefix, "-")
+			missing = append(missing, fmt.Sprintf("%s (expected: %s)", r.Path, expectedPrefix))
+		}
+	}
+
+	if len(missing) == 0 {
+		if checked == 0 {
+			return &CheckResult{
+				Name:    c.Name(),
+				Status:  StatusOK,
+				Message: "No beads databases to check",
+			}
+		}
+		return &CheckResult{
+			Name:    c.Name(),
+			Status:  StatusOK,
+			Message: fmt.Sprintf("All %d database(s) have issue_prefix configured", checked),
+		}
+	}
+
+	return &CheckResult{
+		Name:    c.Name(),
+		Status:  StatusError,
+		Message: fmt.Sprintf("%d database(s) missing issue_prefix config", len(missing)),
+		Details: missing,
+		FixHint: "Run 'gt doctor --fix' to set issue_prefix in each database",
+	}
+}
+
+// Fix sets issue_prefix in databases that are missing it.
+func (c *DatabasePrefixCheck) Fix(ctx *CheckContext) error {
+	beadsDir := filepath.Join(ctx.TownRoot, ".beads")
+
+	routes, err := beads.LoadRoutes(beadsDir)
+	if err != nil || len(routes) == 0 {
+		return nil // Nothing to fix
+	}
+
+	for _, r := range routes {
+		rigBeadsPath := filepath.Join(ctx.TownRoot, r.Path, ".beads")
+		rigDB := filepath.Join(rigBeadsPath, "beads.db")
+
+		// Skip if database doesn't exist
+		if _, err := os.Stat(rigDB); os.IsNotExist(err) {
+			continue
+		}
+
+		// Check if prefix is already set via bd
+		checkCmd := exec.Command("bd", "--no-daemon", "config", "get", "issue_prefix")
+		checkCmd.Dir = filepath.Join(ctx.TownRoot, r.Path)
+		output, err := checkCmd.CombinedOutput()
+		if err == nil {
+			outputStr := strings.TrimSpace(string(output))
+			if !strings.Contains(outputStr, "(not set)") && outputStr != "" {
+				continue // Already set
+			}
+		}
+
+		// Set the prefix - try bd first, fall back to sqlite3 if bd fails
+		// (bd fails when issue_prefix is missing because it considers DB "not initialized")
+		expectedPrefix := strings.TrimSuffix(r.Prefix, "-")
+		setCmd := exec.Command("bd", "--no-daemon", "config", "set", "issue_prefix", expectedPrefix)
+		setCmd.Dir = filepath.Join(ctx.TownRoot, r.Path)
+		if _, bdErr := setCmd.CombinedOutput(); bdErr != nil {
+			// bd failed - use sqlite3 directly to set the config
+			// This handles the case where bd refuses to operate on a DB missing issue_prefix
+			sqlCmd := exec.Command("sqlite3", rigDB,
+				fmt.Sprintf("INSERT OR REPLACE INTO config (key, value) VALUES ('issue_prefix', '%s');", expectedPrefix))
+			if output, sqlErr := sqlCmd.CombinedOutput(); sqlErr != nil {
+				return fmt.Errorf("setting issue_prefix for %s via sqlite3: %v (%s)", r.Path, sqlErr, strings.TrimSpace(string(output)))
+			}
+		}
+	}
+
+	return nil
+}
